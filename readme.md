@@ -1,0 +1,1 @@
+This repository contains CloudFormation templates to deploy some of the prime AWS resources
