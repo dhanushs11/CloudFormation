@@ -1,0 +1,115 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for EFS .
+Parameters:
+  Environment:
+    Type: String
+  ApplicationPrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of private subnet IDs for the application
+  EFSKMSKeyID:
+    Type: String
+    Description: Provide the KMS Key for EFS Encryption.
+  EFSThreshold:
+    Type: Number
+    Description: Threshold for EFS Burst Credit Balance Alarm
+  EFSName:
+    Type: String
+    Description: Name of the EFS
+  SNSKMSKeyID:
+    Type: String
+    Description: KMS Key ID for SNS encryption
+  SNSEmailID:
+    Type: String
+    Description: Email address for SNS notifications
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where the EFS will be created
+  ClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security Group ID of the EKS Cluster
+Resources:
+  ## Elastic File System(EFS) for EKS Cluster
+  FileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      FileSystemTags:
+      - Key: Name
+        Value: !Ref EFSName
+      - Key: Environment
+        Value: !Ref Environment
+      PerformanceMode: "generalPurpose"
+      ThroughputMode: "bursting"
+      Encrypted: true
+      KmsKeyId: !Ref EFSKMSKeyID
+      LifecyclePolicies:
+      - TransitionToIA: AFTER_14_DAYS
+      BackupPolicy:
+        Status: ENABLED
+
+  ## EFS Security Group(Allowed only for EKS Cluster)
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EFS security group
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 2049
+        ToPort: 2049
+        SourceSecurityGroupId: !Ref ClusterSecurityGroup
+      SecurityGroupEgress:
+      - IpProtocol: -1
+        CidrIp: 0.0.0.0/0
+      Tags:
+      - Key: "Environment"
+        Value: !Ref Environment
+  ## Mount Targets For EFS
+  MountTargetResource1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Select [0, !Ref ApplicationPrivateSubnetIds]
+      SecurityGroups:
+      - !Ref EfsSecurityGroup
+  MountTargetResource2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Select [1, !Ref ApplicationPrivateSubnetIds]
+      SecurityGroups:
+      - !Ref EfsSecurityGroup
+  ## Alarm for burst credit balance of an Amazon Elastic File System (Amazon EFS) filesystem.
+  EFSBurstCreditBalanceAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: EFS-Burst-Credit-Balance-Alarm
+      Namespace: AWS/EFS
+      MetricName: BurstCreditBalance
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: !Ref EFSThreshold
+      ComparisonOperator: LessThanOrEqualToThreshold
+      AlarmDescription: Alarm for low BurstCreditBalance in EFS
+      Dimensions:
+      - Name: FileSystemId
+        Value: !Ref FileSystem
+      AlarmActions:
+      - !Ref EFSTopic
+      OKActions:
+      - !Ref EFSTopic
+  EFSTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      DisplayName: "EFSTopic"
+      TopicName: "EFSTopic"
+      KmsMasterKeyId: !Ref SNSKMSKeyID
+      Tags:
+      - Key: "Environment"
+        Value: !Ref Environment
+  EFSSubscription:
+    Type: "AWS::SNS::Subscription"
+    Properties:
+      Protocol: "email"
+      Endpoint: !Ref SNSEmailID
+      TopicArn: !Ref EFSTopic

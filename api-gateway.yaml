@@ -1,0 +1,175 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation Template for public API gateway
+
+Parameters:
+  APIName:
+    Type: String
+    Description: Give the name of the API
+  VPCLinkName:
+    Type: String
+    Description: Give the name of the VPC Link
+  NetworkLoadBalancerARN:
+    Type: String
+    Description: Provide the ARN of Network load balancer
+  NLBDNS:
+    Type: String
+    Description: DNS of network load balancer
+  NLBZoneID:
+    Type: String
+    Description: Zone ID of network load balancer
+  VPC:
+    Type: AWS::EC2::VPC::Id
+    Description: ID of the existing VPC
+  DNSRecordName:
+    Type: String
+    Description: Provide the record
+  XRAYtracing:
+    Type: String
+    Description: true or false for XRAY tracing
+    Default: true
+  CloudwatchLogLevel:
+    Type: String
+    Description: Only error or info allowed
+    Default: error
+
+Resources:
+
+  
+
+
+  CPRESTAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Description: CP REST API Gateway to expose microservice
+      EndpointConfiguration:
+        Types:
+        - REGIONAL
+      Name: !Ref APIName
+  
+  CPAPICloudWatchRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - >-
+          arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+
+  Account:
+    Type: 'AWS::ApiGateway::Account'
+    DependsOn: CPAPICloudWatchRole
+    Properties:
+      CloudWatchRoleArn: !GetAtt 
+        - CPAPICloudWatchRole
+        - Arn
+
+  CPVPCLink:
+    Type: AWS::ApiGateway::VpcLink
+    Properties:
+      Description: CP VPC Link
+      Name: !Ref VPCLinkName
+      TargetArns:
+      - !Ref NetworkLoadBalancerARN
+  
+  
+
+  CPResourceAPI:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref CPRESTAPI
+      ParentId: !GetAtt CPRESTAPI.RootResourceId  # Root level resource
+      PathPart: api
+  CPResourceV1:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref CPRESTAPI
+      ParentId: !Ref CPResourceAPI  # Parent is /api
+      PathPart: v1
+  CPResourceRequest:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CPRESTAPI
+      ParentId: !Ref CPResourceV1 
+      PathPart: path2
+
+
+
+  CPResourceVerifyEquitiesToken:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CPRESTAPI
+      ParentId: !Ref CPResourceRequest 
+      PathPart: path3
+
+  CPAPIGatewayVerifyEquitiesMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CPRESTAPI
+      HttpMethod: GET # Set the required HTTP method
+      ResourceId: !Ref CPResourceVerifyEquitiesToken 
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.querystring.token: true # Expecting 'token' in the query string
+        method.request.header.Authorization: true # Expecting 'Authorization' header
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.x-user-id: true # Custom header to return the x-user-id
+            method.response.header.Access-Control-Allow-Origin: "'*'" # CORS header to allow any origin
+      Integration:
+        ConnectionType: VPC_LINK
+        Type: HTTP
+        ConnectionId: !Ref CPVPCLink
+        Uri: !Join
+          - ''
+          - - https://
+            - !Ref DNSRecordName
+            - /api/v1/path1/path2
+        IntegrationHttpMethod: POST
+        RequestParameters:
+          integration.request.querystring.token: "method.request.querystring.token" # Map 'token' from query string
+          integration.request.header.Authorization: "method.request.header.Authorization" # Pass 'Authorization' header
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.x-user-id: "integration.response.body.userId" # Map userId from body to x-user-id header
+
+ 
+  CPAPIStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref CPRESTAPI
+      DeploymentId: !Ref CPAPIDeployment
+      StageName: CPStage
+      MethodSettings:
+        - DataTraceEnabled: true
+          HttpMethod: '*'
+          ResourcePath: /*
+          MetricsEnabled: true
+          LoggingLevel: !Ref CloudwatchLogLevel
+      AccessLogSetting:
+        DestinationArn: !GetAtt CPAPILogGroup.Arn
+        Format: $context.extendedRequestId $context.identity.sourceIp $context.identity.caller $context.identity.user [$context.requestTime] "$context.httpMethod $context.resourcePath $context.protocol" $context.status $context.responseLength $context.requestId  
+      TracingEnabled: !Ref XRAYtracing
+  CPAPILogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join
+        - '-'
+        - - !Ref CPRESTAPI
+          - access-logs
+
+  CPAPIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: CPAPIGatewayVerifyEquitiesMethod
+    Properties:
+      RestApiId: !Ref CPRESTAPI
+  

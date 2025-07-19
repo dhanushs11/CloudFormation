@@ -1,0 +1,168 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for alarms using CloudWatch filters and alarms
+Parameters:
+  EKSClusterLogGroupName:
+    Type: String
+    Description: Provide the log group name of the EKS Cluster logs
+  EKSClusterLogGroupARN:
+    Type: String
+    Description: Provide the log group ARN of the EKS Cluster logs
+  SNSKMSKeyARN:
+    Description: Provide the KMS key ARN for SNS
+    Type: String
+  SNSEmailID:
+    Description: Provide the email ID for SNS
+    Type: String
+  Environment:
+    Description: Used to tag the resources created to a specific environment.
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /account/environment
+
+Resources:
+  CwScaleFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      DestinationArn: !GetAtt CWSNSTriggerLambda.Arn
+      FilterName: PodScaleFilter
+      FilterPattern: '{$.responseObject.message = "*above target*" || $.responseObject.message = "*below target*"}'
+      LogGroupName: !Ref EKSClusterLogGroupName
+
+  CWSNSTriggerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import base64
+          import gzip
+          import os
+          import boto3
+
+          def lambda_handler(event, context):
+              # Decode and decompress the log data
+              compressed_payload = base64.b64decode(event['awslogs']['data'])
+              uncompressed_payload = gzip.decompress(compressed_payload)
+              log_data = json.loads(uncompressed_payload)
+              environment = os.environ.get('ENVIRONMENT', 'unknown')
+
+
+              # Process each log event
+              for log_event in log_data['logEvents']:
+                  # Parse the message as JSON
+                  message = json.loads(log_event['message'])
+
+                  # Extract the required information
+                  if 'responseObject' in message and 'message' in message['responseObject']:
+                      hpa_name = message['responseObject']['involvedObject']['name']
+                      namespace = message['responseObject']['involvedObject']['namespace']
+                      hpa_message = message['responseObject']['message']
+                      timestamp = message['responseObject']['lastTimestamp']
+
+                      # Check if the message contains "above target" or "below target"
+                      if "above target" in hpa_message or "below target" in hpa_message:
+                          # Extract new size and reason from the message
+                          new_size = hpa_message.split(';')[0].split(':')[1].strip()
+                          reason = hpa_message.split(';')[1].strip()
+                          # Determine scaling direction
+                          scaling_direction = "Scale Up" if "above target" in hpa_message else "Scale Down"
+                          # Construct the message to be sent
+                          sns_message = f"""
+                              Environment: {environment}
+                              HPA Name: {hpa_name}
+                              Namespace: {namespace}
+                              New Size: {new_size}
+                              Scaling Direction: {scaling_direction}
+                              Reason: {reason}
+                              Timestamp: {timestamp}
+                          """
+                          # Send message to SNS with scaling direction in the subject
+                          send_to_sns(sns_message, f"HPA {scaling_direction} Event: {hpa_name}")
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Log processing complete')
+              }
+
+          def send_to_sns(message, subject):
+              sns_client = boto3.client('sns')
+              sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+              try:
+                  response = sns_client.publish(
+                      TopicArn=sns_topic_arn,
+                      Message=message,
+                      Subject=subject
+                  )
+                  print(f"Message sent to SNS. Message ID: {response['MessageId']}")
+              except Exception as e:
+                  print(f"Error sending message to SNS: {str(e)}")
+
+      Description: Function to trigger SNS notifications on HPA scaling events
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      ReservedConcurrentExecutions: 1
+      Role: !GetAtt LambdaAutoscalingSNSTriggerRole.Arn
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref LambdaAutoscalingSNSTopic
+          ENVIRONMENT: !Ref Environment
+
+  LambdaAutoscalingSNSTriggerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CWSNSTriggerLambda
+      Action: "lambda:InvokeFunction"
+      Principal: "logs.ap-southeast-1.amazonaws.com"
+      SourceArn: !Ref EKSClusterLogGroupARN
+
+  LambdaAutoscalingSNSTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      DisplayName: "LambdaAutoscalingSNSTopic"
+      TopicName: "LambdaAutoscalingSNSTopic"
+      KmsMasterKeyId: !Ref SNSKMSKeyARN
+      Tags:
+        - Key: "Environment"
+          Value: !Ref Environment
+
+  LambdaAutoscalingSNSSubscription:
+    Type: "AWS::SNS::Subscription"
+    Properties:
+      Protocol: "email"
+      Endpoint: !Ref SNSEmailID
+      TopicArn: !Ref LambdaAutoscalingSNSTopic
+
+  LambdaAutoscalingSNSTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaSNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: PublishToSNS
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref LambdaAutoscalingSNSTopic
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !Ref SNSKMSKeyARN
+              - Sid: CreateLogGroup
+                Effect: Allow
+                Action: logs:CreateLogGroup
+                Resource: !Sub arn:aws:logs:ap-southeast-1:${AWS::AccountId}:*
+              - Sid: LogStream
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:ap-southeast-1:${AWS::AccountId}:log-group:/aws/lambda/*

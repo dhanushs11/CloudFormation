@@ -1,0 +1,38 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for asymmetric type KMS key
+
+Parameters:
+
+  Environment:
+    Type: AWS::SSM::Parameter::Value<String>
+  
+  EncryptionKMSKeyAlias:
+    Type: String
+    Description: Provide the alias for encryption kms key
+
+Resources:
+
+  EncryptionKMSAlias:
+    Type: 'AWS::KMS::Alias'
+    Properties:
+      AliasName: !Ref EncryptionKMSKeyAlias
+      TargetKeyId: !Ref EncryptionKMSKeyID
+
+  EncryptionKMSKeyID:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for encryption and decryption of password in user ms
+      KeySpec: RSA_3072
+      KeyUsage: ENCRYPT_DECRYPT
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: Enable IAM User Permissions
+          Effect: Allow
+          Principal:
+            AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+          Action: kms:*
+          Resource: "*"
+      Tags:
+      - Key: "Environment"
+        Value: !Ref Environment

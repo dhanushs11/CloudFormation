@@ -1,0 +1,301 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for Opensearch
+
+Parameters:
+  ## Use Exisitng SSM Parameters
+  Environment:
+    Type: AWS::SSM::Parameter::Value<String>
+  ## Use Exisitng VPC Parameters
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: ID of the VPC
+
+  ClusterSecurityGroup:
+    Type: String
+    Description: Provide the security group id for EKS Cluster
+  AuroraSecurityGroup:
+    Type: String
+    Description: Provide the security group id for RDS Cluster
+  JumpHostSecurityGroup:
+    Type: String
+    Description: Provide the security group id for Jumphost Ec2 instance
+
+  SubnetIdsForOpenSearch:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Select the subnet for the OpenSearch cluster ( only 1 for non-prod )
+
+  InstanceCount:
+    Type: Number
+    Default: 1
+    Description: Enter the number of instances for the OpenSearch cluster (1 node for non prod)
+  InstanceType:
+    Type: String
+    Description: Enter the instance type for the OpenSearch cluster
+    AllowedValues:
+    - "t3.small.search"
+    - "t3.medium.search"
+    - "r5.large.search"
+    - "r5.xlarge.search"
+    - "r5.2xlarge.search"
+    - "r5.4xlarge.search"
+    - "r5.12xlarge.search"
+  VolumeType:
+    Type: String
+    Default: gp3
+    Description: Enter the EBS volume type for the OpenSearch cluster
+  VolumeSize:
+    Type: Number
+    Default: 10
+    Description: Enter the size (in GB) of the EBS volumes for the OpenSearch cluster
+  OffPeakWindowHour:
+    Type: Number
+    Description: Provide the time (HH) for off peak window start (UTC)
+  AutoSoftwareUpdateOption:
+    Type: String
+
+    Description: Enable if automated version updates are needed (true for dev,uat)
+    AllowedValues:
+    - true
+    - false
+  MasterUsername:
+    Type: String
+    Description: Enter the master username for opensearch cluster
+
+  MasterPassword:
+    Type: String
+    Description: Enter the master password for opensearch cluster
+  ZoneAwareness:
+    Type: String
+    Description: Set to true for more than one subnets
+
+  SNSKMSKeyID:
+    Type: String
+    Description: Give the key id for SNS topic encryption
+  SNSEmailID:
+    Type: String
+    Description: Give the email for cloudwatch alers
+  
+
+Resources:
+
+  ####################################################################################################
+  CPOpenSearchCluster:
+    Type: 'AWS::OpenSearchService::Domain'
+    Properties:
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            AWS: '*'
+          Action: 'es:*'
+          Resource: '*'
+      AdvancedSecurityOptions:
+        Enabled: true
+        InternalUserDatabaseEnabled: true
+        MasterUserOptions:
+          MasterUserName: !Ref MasterUsername
+          MasterUserPassword: !Ref MasterPassword
+      ClusterConfig:
+        InstanceCount: !Ref InstanceCount
+        InstanceType: !Ref InstanceType
+        DedicatedMasterEnabled: false
+        ZoneAwarenessEnabled: !Ref ZoneAwareness
+        MultiAZWithStandbyEnabled: false
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+        TLSSecurityPolicy: Policy-Min-TLS-1-2-PFS-2023-10
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: !Ref VolumeType
+        VolumeSize: !Ref VolumeSize
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+      OffPeakWindowOptions:
+        Enabled: true
+        OffPeakWindow:
+          WindowStartTime:
+            Hours: !Ref OffPeakWindowHour
+            Minutes: 0
+      SoftwareUpdateOptions:
+        AutoSoftwareUpdateEnabled: !Ref AutoSoftwareUpdateOption
+      VPCOptions:
+        SubnetIds: !Ref SubnetIdsForOpenSearch
+        SecurityGroupIds:
+        - !Ref OpenSearchSecurityGroup
+      EncryptionAtRestOptions:
+        Enabled: true
+        KmsKeyId: !Ref OpenSearchKMSKeyID
+      Tags:
+      - Key: "Environment"
+        Value: !Ref Environment
+      
+      LogPublishingOptions:
+        ES_APPLICATION_LOGS:
+          CloudWatchLogsLogGroupArn: !GetAtt ApplicationLogsCloudWatchLogGroup.Arn
+          Enabled: true
+        INDEX_SLOW_LOGS:
+          CloudWatchLogsLogGroupArn: !GetAtt IndexSlowLogsCloudWatchLogGroup.Arn
+          Enabled: true
+        SEARCH_SLOW_LOGS:
+          CloudWatchLogsLogGroupArn: !GetAtt SearchSlowLogsCloudWatchLogGroup.Arn
+          Enabled: true
+        AUDIT_LOGS:
+          CloudWatchLogsLogGroupArn: !GetAtt AuditLogsCloudWatchLogGroup.Arn
+          Enabled: true
+
+
+  OpenSearchSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the Opensearch domain
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+      - IpProtocol: -1
+        SourceSecurityGroupId: !Ref ClusterSecurityGroup
+      - IpProtocol: -1
+        SourceSecurityGroupId: !Ref AuroraSecurityGroup
+      - IpProtocol: -1
+        SourceSecurityGroupId: !Ref JumpHostSecurityGroup
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: !Ref ZscalerIP
+  OpenSearchKMSAlias:
+    Type: 'AWS::KMS::Alias'
+    Properties:
+      AliasName: alias/opensearch-kms-key
+      TargetKeyId: !Ref OpenSearchKMSKeyID
+  OpenSearchKMSKeyID:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: OpenSearch KMS key for encryption and decryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: Enable IAM User Permissions
+          Effect: Allow
+          Principal:
+            AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+          Action: kms:*
+          Resource: "*"
+      Tags:
+      - Key: "Environment"
+        Value: !Ref Environment
+        
+
+
+
+  ApplicationLogsCloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/opensearch/${Environment}/application-logs" # Customize the log group name based on your preference or requirements
+
+  IndexSlowLogsCloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/opensearch/${Environment}/index-slow-logs"
+
+  SearchSlowLogsCloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/opensearch/${Environment}/search-slow-logs"
+
+  AuditLogsCloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/opensearch/${Environment}/audit-logs"
+
+  OpenSearchCloudWatchPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: OpenSearchCloudWatchPolicy
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "AllowOpenSearchToPublishLogs",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "es.amazonaws.com"
+              },
+              "Action": [
+                "logs:PutLogEvents",
+                "logs:CreateLogStream"
+              ],
+              "Resource": [
+                "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/opensearch/${Environment}/application-logs:*",
+                "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/opensearch/${Environment}/index-slow-logs:*",
+                "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/opensearch/${Environment}/search-slow-logs:*",
+                "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/opensearch/${Environment}/audit-logs:*"
+              ]
+            }
+          ]
+        }
+  OpensearchClusterStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: ElasticsearchClusterStatusAlarm
+      Namespace: 'AWS/ES'
+      MetricName: 'ClusterStatus.yellow'
+      Statistic: Maximum
+      Period: 60
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmDescription: Alarm for yellow or red cluster status in Amazon ES
+      EvaluationPeriods: 5
+      Threshold: 1
+      Dimensions:
+      - Name: ClientId
+        Value: !Ref AWS::AccountId
+      - Name: DomainName
+        Value: !Ref CPOpenSearchCluster
+      AlarmActions:
+      - !Ref OpensearchClusterStatusTopic
+      OKActions:
+      - !Ref OpensearchClusterStatusTopic
+
+  ClusterStatusRed:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      # Alarm name + description
+      AlarmName: 'ClusterStatus.red >= 1'
+      AlarmDescription: 'Email when ClusterStatus.red >=1, 1 time within 1 minutes'
+      # Account + cluster
+      Namespace: 'AWS/ES'
+      Dimensions:
+      - Name: ClientId
+        Value: !Ref AWS::AccountId
+      - Name: DomainName
+        Value: !Ref CPOpenSearchCluster
+
+      Statistic: Maximum
+      MetricName: 'ClusterStatus.red'
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      Period: 60
+      EvaluationPeriods: 5
+      # Action
+      OKActions:
+      - !Ref OpensearchClusterStatusTopic
+      AlarmActions:
+      - !Ref OpensearchClusterStatusTopic
+
+  OpensearchClusterStatusTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      DisplayName: "OpensearchClusterStatusTopic"
+      TopicName: "OpensearchClusterStatusTopic"
+      KmsMasterKeyId: !Ref SNSKMSKeyID
+      Tags:
+      - Key: "Environment"
+        Value: !Ref Environment
+
+  OpensearchClusterStatusTopicSubscription:
+    Type: "AWS::SNS::Subscription"
+    Properties:
+      Protocol: "email"
+      Endpoint: !Ref SNSEmailID
+      TopicArn: !Ref OpensearchClusterStatusTopic
+

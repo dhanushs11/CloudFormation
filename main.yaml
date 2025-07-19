@@ -1,0 +1,414 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for EKS and RDS
+
+Parameters:
+  EnvironmentType:
+    Description: Select the environment type
+    Type: String  
+
+  Environment:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /account/environment
+
+  ## Use Exisitng VPC Parameters
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: ID of the existing VPC
+  ApplicationPrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Provide the subnets for application(fargate profile and EKS), EFS
+  DatabasePrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Provide the subnets for Aurora db subnet group
+  ## Aurora Postegresql Parameters
+  AuroraDBPort:
+    Type: String
+    Description: Provide port number of Aurora PostegresqlDB.
+  AuroraDBKmsKeyID:
+    Type: String
+    Description: Provide KMSKeyID for Encryption of AuroraPostegreSql DB.
+  AutoMinorVersionUpgrade:
+    Type: String
+    Description: Set to true if auto minor version upgrade is required
+    AllowedValues:
+    - "true"
+    - "false"
+  DBInstanceClass:
+    Type: String
+    Description: Select the sizing for RDS instance
+    AllowedValues:
+    - "db.t3.micro"
+    - "db.t3.small"
+    - "db.t3.medium"
+    - "db.t3.large"
+    - "db.t4g.medium"
+    - "db.t4g.large"
+    - "db.r5.large"
+    - "db.r5.xlarge"
+    - "db.r5.2xlarge"
+  AuroraMasterUsername:
+    Type: String
+    Description: Username for Aurora DB
+  ## SNS Parameters
+  SNSKMSKeyID:
+    Type: String
+    Description: Give the key id for SNS topic encryption
+  SNSEmailID:
+    Type: String
+    Description: Give the email for cloudwatch alers
+  ## AWS Backup KMS Key id parameter
+  BackupsKMSKeyID:
+    Type: String
+    Description: Give the key id for Backup vault encryption
+  WarningThreshold:
+    Type: String
+    Description: Percentage value for warning alarm
+    Default: 75
+  CriticalThreshold:
+    Type: String
+    Description: Percentage value for critical alarm
+    Default: 90
+  DatabaseConnections:
+    Type: String
+    Description: Number of database connections for alarm
+    Default: 10
+ 
+  BackupRetentionPeriod:
+    Type: String
+    Description: Provide the value for Aurora db backup retention period (in days)
+    Default: 14
+
+    
+
+Conditions:
+  CreateProdResources: !Equals
+  - !Ref EnvironmentType
+  - prod
+  IsProd: !Equals [!Ref EnvironmentType, "prod"]
+  IsRollback: !Equals [!Ref RDSRollback, "true"]
+  ProdRollback: !And [!Condition IsProd, !Condition IsRollback]
+  CommonRollback: !Condition IsRollback
+
+
+Resources:
+  CPAuroraRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Environment}-AuroraRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - rds.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AWSKeyManagementServicePowerUser
+      Tags:
+      - Key: "Environment"
+        Value: !Ref Environment
+  # ## EKS Cluster Security Group
+  ClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EKS cluster security group
+      VpcId: !Ref VPCId
+      Tags:
+      - Key: "Environment"
+        Value: !Ref Environment
+ 
+  ControlPlaneSecurityGroupIngressRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ClusterSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref ClusterSecurityGroup
+
+ 
+ AuroraSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS Aurora security group
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: !Ref AuroraDBPort
+        ToPort: !Ref AuroraDBPort
+        SourceSecurityGroupId: !Ref ClusterSecurityGroup
+      Tags:
+      - Key: "Environment"
+        Value: !Ref Environment
+  Cluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Sub ${Environment}-EKSCluster
+      RoleArn: !GetAtt EKSClusterRole.Arn
+      Version: '1.32'
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+          - Type: api
+          - Type: audit
+      ResourcesVpcConfig:
+        SecurityGroupIds:
+        - !Ref ClusterSecurityGroup
+        SubnetIds: !Ref ApplicationPrivateSubnetIds
+        EndpointPrivateAccess: true
+        EndpointPublicAccess: false
+      Tags:
+      - Key: "Environment"
+        Value: !Ref Environment
+  # ## EKS Cluster Role
+  EKSClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Environment}-EKSClusterRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - eks.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+      - arn:aws:iam::aws:policy/AmazonEKSServicePolicy
+      - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Tags:
+      - Key: "Environment"
+        Value: !Ref Environment
+
+  # ## Fargate Profile for EKS Cluster
+  FargateProfile:
+    Type: AWS::EKS::FargateProfile
+    DependsOn: Cluster
+    Properties:
+      ClusterName: !Ref Cluster
+      FargateProfileName: !Sub ${Environment}-Fargateprofile
+      PodExecutionRoleArn: !GetAtt FargateProfileRole.Arn
+      Subnets: !Ref ApplicationPrivateSubnetIds
+      Selectors:
+      - Namespace: default
+      - Namespace: kube-system
+      - Namespace: !Ref Environment
+      - Namespace: aws-observability
+      - Namespace: fargate-container-insights
+      Tags:
+      - Key: "Environment"
+        Value: !Ref Environment
+  # ## Fargate Profile role for EKS Cluster
+  FargateProfileRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Environment}-FargateProfile-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - eks-fargate-pods.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonEKSFargatePodExecutionRolePolicy
+      Tags:
+      - Key: "Environment"
+        Value: !Ref Environment
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub ${Environment}-DBsubnet-group
+      DBSubnetGroupDescription: Subnet group for Aurora DB
+      SubnetIds: !Ref DatabasePrivateSubnetIds
+      Tags:
+      - Key: "Environment"
+        Value: !Ref Environment
+  ## RDS Aurora Cluster
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: '16.8'
+      CopyTagsToSnapshot: true
+      DeletionProtection: true
+      DBClusterIdentifier: !Sub ${Environment}-Aurora-cluster
+      DBClusterParameterGroupName: !Ref DBClusterParameterGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      DatabaseName: customerportaldatabase
+      MasterUsername: !Ref AuroraMasterUsername
+      ManageMasterUserPassword: true
+      StorageEncrypted: true
+      Port: !Ref AuroraDBPort
+      BackupRetentionPeriod: !Ref BackupRetentionPeriod
+      PreferredBackupWindow: '00:00-00:30'
+      KmsKeyId: !Ref AuroraDBKmsKeyID
+      EnableIAMDatabaseAuthentication: true
+      EnableCloudwatchLogsExports:
+      - postgresql
+      AssociatedRoles:
+      - RoleArn: !GetAtt CPAuroraRole.Arn
+        FeatureName: s3Import
+      VpcSecurityGroupIds:
+      - !Ref AuroraSecurityGroup # Attach AuroraSecurityGroup
+      Tags:
+      - Key: "Environment"
+        Value: !Ref Environment
+  DBClusterParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      Description: Cluster parameter group
+      Family: aurora-postgresql16 # Change the family if needed
+      Parameters:
+        log_min_messages: 'ERROR'                # Log errors
+        log_min_duration_statement: '20000'       # Log queries slower than 5 seconds
+        log_error_verbosity: 'DEFAULT'
+        log_statement: 'none'
+        log_min_error_statement: 'error'
+        
+  ## RDS Aurora Instance
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: '16.8'
+      DBInstanceIdentifier: !Sub ${Environment}-Aurora-DB-instance
+      CACertificateIdentifier: rds-ca-rsa2048-g1
+      DBInstanceClass: !Ref DBInstanceClass
+      DBClusterIdentifier: !Ref AuroraCluster
+      AutoMinorVersionUpgrade: !Ref AutoMinorVersionUpgrade
+      PubliclyAccessible: false
+      StorageType: aurora
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      DBParameterGroupName: !Ref DBParameterGroup
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt ['EnhancedMonitoringRole', 'Arn']
+      Tags:
+      - Key: "Environment"
+        Value: !Ref Environment
+
+  ReadDBInstance:
+    Type: AWS::RDS::DBInstance
+    Condition: CreateProdResources
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: '16.8'
+      DBInstanceIdentifier: !Sub ${Environment}-Aurora-DB-Read-instance
+      CACertificateIdentifier: rds-ca-rsa2048-g1
+      DBInstanceClass: !Ref DBInstanceClass
+      DBClusterIdentifier: !Ref AuroraCluster
+      AutoMinorVersionUpgrade: !Ref AutoMinorVersionUpgrade
+      PubliclyAccessible: false
+      StorageType: aurora
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      DBParameterGroupName: !Ref DBParameterGroup
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt ['EnhancedMonitoringRole', 'Arn']
+      Tags:
+      - Key: "Environment"
+        Value: !Ref Environment
+
+  ## CPU Utilization for AuroraPostgresql
+  AuroraPostgresqlCPUUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Aurora-Postgresql-CPUUtilization-Alarm-cluster-level-warning
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: !Ref WarningThreshold # Adjust as per your CPU utilization threshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmDescription: Alarm for  CPU utilization warning in Aurora PostgreSQL cluster
+      Dimensions:
+      - Name: DBClusterIdentifier
+        Value: !Ref AuroraCluster
+      AlarmActions:
+      - !Ref SNSTopic
+      OKActions:
+      - !Ref SNSTopic
+  AuroraPostgresqlCPUUtilizationCriticalAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Aurora-Postgresql-CPUUtilization-Alarm-cluster-level-critical
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: !Ref CriticalThreshold # Adjust as per your CPU utilization threshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmDescription: Alarm for critical CPU utilization in Aurora PostgreSQL Cluster
+      Dimensions:
+      - Name: DBClusterIdentifier
+        Value: !Ref AuroraCluster
+
+      AlarmActions:
+      - !Ref SNSTopic
+      OKActions:
+      - !Ref SNSTopic
+  ## Enhanced Monitoring Role for RDS Postgres
+  EnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: ''
+          Effect: Allow
+          Principal:
+            Service: monitoring.rds.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+      Path: "/"
+
+  DBParameterGroup:
+    Type: "AWS::RDS::DBParameterGroup"
+    Properties:
+      Description: "Parameter group for Aurora"
+      Family: "aurora-postgresql16"
+      Parameters:
+        log_statement: "none"
+        log_duration: "off"
+        log_min_duration_statement: "20000"
+
+      Tags:
+      - Key: "Environment"
+        Value: !Ref Environment      
+  DBLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: "AuroraDBLogs"
+      RetentionInDays: 1
+      Tags:
+      - Key: "Environment"
+        Value: !Ref Environment
+  DBLogStream:
+    Type: "AWS::Logs::LogStream"
+    Properties:
+      LogGroupName: !Ref DBLogGroup
+      LogStreamName: "AuroraDBStream"
+  SNSTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      DisplayName: "AuroraDBLogTopic"
+      TopicName: "AuroraDBLogTopic"
+      KmsMasterKeyId: !Ref SNSKMSKeyID
+      Tags:
+      - Key: "Environment"
+        Value: !Ref Environment
+      - Key: "map-migrated"
+        Value: !Ref MapDBMigratedValue
+      
+  SNSSubscription:
+    Type: "AWS::SNS::Subscription"
+    Properties:
+      Protocol: "email"
+      Endpoint: !Ref SNSEmailID
+      TopicArn: !Ref SNSTopic
+

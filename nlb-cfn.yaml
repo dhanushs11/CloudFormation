@@ -1,0 +1,100 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for Network Load Balancer
+
+Parameters:
+  NLBName:
+    Type: String
+    Description: Name for the Network Load Balancer
+
+  IP1:
+    Type: String
+    Description: Private IPv4 Address for Subnet 1
+
+  IP2:
+    Type: String
+    Description: Private IPv4 Address for Subnet 2
+
+  ExternalALBSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Provide the private subnets for ALB
+
+  ExternalALB:
+    Type: String
+    Description: ARN of the external ALB
+
+  VPC:
+    Type: AWS::EC2::VPC::Id
+    Description: ID of the existing VPC
+  S3LogBucket:
+    Type: String
+    Description: Provide the name of the S3 Bucket to send NLB logs
+
+Resources:
+  NetworkLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Ref NLBName
+      Scheme: internal
+      Type: network
+      SubnetMappings:
+        - PrivateIPv4Address: !Ref IP1
+          SubnetId: !Select ["0", !Ref ExternalALBSubnets]
+        - PrivateIPv4Address: !Ref IP2
+          SubnetId: !Select ["1", !Ref ExternalALBSubnets]
+      LoadBalancerAttributes:
+        - Key: deletion_protection.enabled
+          Value: 'true'
+        - Key: access_logs.s3.enabled
+          Value: 'true'
+        - Key: access_logs.s3.bucket
+          Value: !Ref S3LogBucket
+        
+        
+  NetworkLoadBalancerTargetGroupTLS:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref 'VPC'
+      Protocol: TCP
+      Port: 443
+      Targets:
+        - Id: !Ref ExternalALB
+      TargetType: alb
+      HealthCheckProtocol: HTTPS
+      HealthCheckPort: "443"
+      HealthCheckPath: "/"
+  NetworkLoadBalancerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref 'VPC'
+      Protocol: TCP
+      Port: 80
+      Targets:
+        - Id: !Ref ExternalALB
+      TargetType: alb
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: "80"
+      HealthCheckPath: "/"
+
+  NetworkLoadBalancerTLSListener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      DefaultActions:
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+              - TargetGroupArn: !Ref NetworkLoadBalancerTargetGroupTLS
+      LoadBalancerArn: !Ref NetworkLoadBalancer
+      Port: 443
+      Protocol: "TCP"
+  
+  NetworkLoadBalancerListener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      DefaultActions:
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+            - TargetGroupArn: !Ref NetworkLoadBalancerTargetGroup
+      LoadBalancerArn: !Ref NetworkLoadBalancer
+      Port: 80
+      Protocol: "TCP"
